@@ -27,6 +27,74 @@ div[data-testid="stMetric"] {
     padding: 14px 16px 8px 16px;
 }
 section[data-testid="stSidebar"] { width: 340px !important; }
+
+/* Make dropdown/multiselect option lists (e.g. Exit Period range,
+   PIP Review Status) scrollable instead of being cut off at the edge
+   of the screen, and give the scrollbar visible styling so it's
+   obvious there's more to scroll to (like the "Custom" option). */
+div[data-baseweb="popover"] ul[role="listbox"] {
+    max-height: 260px !important;
+    overflow-y: auto !important;
+}
+div[data-baseweb="popover"] ul[role="listbox"]::-webkit-scrollbar {
+    width: 8px;
+}
+div[data-baseweb="popover"] ul[role="listbox"]::-webkit-scrollbar-track {
+    background: rgba(255,255,255,0.05);
+}
+div[data-baseweb="popover"] ul[role="listbox"]::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.30);
+    border-radius: 4px;
+}
+
+/* Sticky main header — pinned summary of the currently filtered data,
+   stays visible while scrolling so you don't have to hunt for it. */
+.main-header-bar {
+    position: sticky;
+    top: 0;
+    z-index: 999;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    background: #0e1117;
+    padding: 12px 14px 10px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.15);
+    margin: 0 0 6px 0;
+}
+.mh-item {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 10px;
+    padding: 6px 14px;
+    min-width: 108px;
+    display: block;
+    text-decoration: none;
+    color: inherit;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+a.mh-item:hover {
+    background: rgba(255,255,255,0.09);
+    border-color: rgba(255,255,255,0.30);
+    transform: translateY(-1px);
+}
+a.mh-item:active {
+    transform: translateY(0px);
+}
+.mh-label {
+    font-size: 0.72rem;
+    opacity: 0.65;
+    white-space: nowrap;
+}
+.mh-value {
+    font-size: 1.25rem;
+    font-weight: 700;
+    line-height: 1.3;
+    white-space: nowrap;
+}
+
+/* Keep jump-to-section links from landing underneath the sticky header. */
+h1, h2, h3 { scroll-margin-top: 92px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,6 +139,7 @@ ROLE_KEYWORDS = {
     "name":          ["employee name", "emp name"],
     "gender":        ["gender", "sex"],
     "doj":           ["doj", "date of joining", "joining date", "hire date"],
+    "dob":           ["date of birth", "dob", "birth date", "birthday"],
     "exit_date":     ["date of exit", "exit date", "dor", "lwd", "last working day", "separation date"],
     "status":        ["employee status", "employment status", "status"],
     "department":    ["department", "dept"],
@@ -213,8 +282,12 @@ if main_key != best_key:
     summary_df = locate_sheet("summary") if "summary" not in main_key.lower() else pd.DataFrame()
 
 # ==========================================================================
-# Sidebar — Vertical filter
+# Sidebar — Vertical filter (locked to Motivity Labs only — every table,
+# chart, and download in this app is restricted to this business unit;
+# other verticals are excluded entirely, not just unselected.)
 # ==========================================================================
+
+FIXED_VERTICAL = "Motivity Labs"
 
 vertical_values = set()
 for d in [emp, notice_df, pip_df, exits_df, summary_df]:
@@ -225,17 +298,62 @@ for d in [emp, notice_df, pip_df, exits_df, summary_df]:
         vertical_values.update(d[vcol].dropna().astype(str).tolist())
 all_verticals = sorted(vertical_values)
 
+selected_verticals = [FIXED_VERTICAL]
+
+# Employee-ID → Vertical lookup, built from whichever sheet(s) actually
+# carry a Vertical column. This is needed because the Employee Master
+# sheet often does NOT have its own Vertical column — without this
+# fallback, apply_vertical() would have nothing to filter on for that
+# sheet and would silently let every business unit through.
+id_vertical_map = {}
+for d in [emp, notice_df, pip_df, exits_df, summary_df]:
+    if d.empty:
+        continue
+    idc = find_col(d, "id")
+    vcol = find_col(d, "vertical")
+    if idc and vcol:
+        for _id, _v in zip(d[idc].astype(str).str.strip(), d[vcol].astype(str)):
+            if _id and _id not in id_vertical_map:
+                id_vertical_map[_id] = _v
+
 st.sidebar.header("Vertical")
-selected_verticals = st.sidebar.multiselect(
-    "Vertical / Business Unit", all_verticals, key="filter_vertical",
-    help="Leave empty to include all verticals.",
-)
+if FIXED_VERTICAL in all_verticals:
+    st.sidebar.success(f"Hard-locked to **{FIXED_VERTICAL}** only — every table and download below excludes anything not confirmed as this business unit.")
+else:
+    st.sidebar.warning(
+        f"Hard-locked to **{FIXED_VERTICAL}**, but it wasn't found in the uploaded data "
+        f"(detected: {', '.join(all_verticals) if all_verticals else 'none'}). No rows will match."
+    )
+if not find_col(emp, "vertical"):
+    st.sidebar.caption(
+        "⚠️ Your Employee Master sheet has no Vertical/Business Unit column of its own, so it can only "
+        "confirm an employee as Motivity Labs by cross-referencing their Employee ID against Notice, PIP, "
+        "or Exit records. Active employees who've never appeared on any of those (which is most of your "
+        "active headcount) can't be confirmed and are excluded under this hard lock. Add a Vertical column "
+        "to the Employee Master to include your full active population accurately."
+    )
 
 def apply_vertical(tdf):
-    if tdf.empty or not selected_verticals:
+    if tdf.empty:
         return tdf
     col = find_col(tdf, "vertical")
-    return tdf[tdf[col].astype(str).isin(selected_verticals)] if col else tdf
+    if col:
+        return tdf[tdf[col].astype(str).isin(selected_verticals)]
+    # Hard lock for sheets with no Vertical column of their own (commonly
+    # the Employee Master): only rows we can POSITIVELY confirm as
+    # Motivity Labs via an Employee ID cross-reference against
+    # Notice/PIP/Exit are kept. Anything unconfirmed is excluded — no
+    # benefit-of-the-doubt inclusion, per explicit instruction to only
+    # ever show Motivity Labs data and nothing else.
+    idc = find_col(tdf, "id")
+    if idc and id_vertical_map:
+        ids_series = tdf[idc].astype(str).str.strip()
+        confirmed_ids = {i for i, v in id_vertical_map.items() if v in selected_verticals}
+        return tdf[ids_series.isin(confirmed_ids)]
+    # No Vertical column and no way to cross-reference at all — cannot
+    # confirm anything as Motivity Labs, so exclude everything rather
+    # than risk showing other verticals.
+    return tdf.iloc[0:0]
 
 # ==========================================================================
 # Sidebar — segment filters
@@ -306,76 +424,162 @@ def apply_pip_status(tdf):
         return tdf
     return tdf[tdf[pip_status_col].astype(str).isin(selected_pip_status)]
 
-# ==========================================================================
-# Sidebar — Report Period (always-visible custom dates)
-# ==========================================================================
-
-st.sidebar.header("Report Period")
-preset = st.sidebar.selectbox(
-    "Quick range",
-    ["All Time", "Today", "Last 7 Days", "Last 30 Days", "This Month", "Last Month", "Custom"],
-    key="period_preset",
-)
-
 today = datetime.date.today()
-if preset == "Today":
-    default_start, default_end = today, today
-elif preset == "Last 7 Days":
-    default_start, default_end = today - datetime.timedelta(days=6), today
-elif preset == "Last 30 Days":
-    default_start, default_end = today - datetime.timedelta(days=29), today
-elif preset == "This Month":
-    default_start, default_end = today.replace(day=1), today
-elif preset == "Last Month":
-    last_month_end = today.replace(day=1) - datetime.timedelta(days=1)
-    default_start, default_end = last_month_end.replace(day=1), last_month_end
-elif preset == "Custom":
-    default_start, default_end = today - datetime.timedelta(days=6), today
-else:
-    default_start = default_end = None
 
-if preset == "All Time":
-    period_start = period_end = None
-else:
-    c1, c2 = st.sidebar.columns(2)
-    period_start = c1.date_input("Start date", value=default_start, key=f"period_start_{preset}")
-    period_end = c2.date_input("End date", value=default_end, key=f"period_end_{preset}")
-    if period_start > period_end:
-        st.sidebar.error("Start date is after end date.")
-
-def overlap_in_period(tdf, start_col, end_col):
-    if tdf.empty or period_start is None or not start_col or start_col not in tdf.columns:
-        return tdf
-    s = tdf[start_col]
-    e = tdf[end_col] if end_col and end_col in tdf.columns else pd.Series(pd.NaT, index=tdf.index)
-    cond = s.notna() & (s.dt.date <= period_end) & (e.isna() | (e.dt.date >= period_start))
-    return tdf[cond]
-
-def point_in_period(tdf, date_col):
-    if tdf.empty or period_start is None or not date_col or date_col not in tdf.columns:
+def _point_in_range(tdf, date_col, range_start, range_end):
+    if tdf.empty or range_start is None or not date_col or date_col not in tdf.columns:
         return tdf
     d = tdf[date_col]
-    return tdf[d.notna() & (d.dt.date >= period_start) & (d.dt.date <= period_end)]
+    start_ts, end_ts = pd.Timestamp(range_start), pd.Timestamp(range_end) + pd.Timedelta(days=1)
+    return tdf[(d >= start_ts) & (d < end_ts)]
 
+# Base filtered segments (vertical + sidebar segment filters applied; no
+# date-period filtering yet — each tracker below gets its own dedicated
+# date-range filter instead of one blanket Report Period).
 notice_seg = filter_tracker(notice_df)
-notice_f = overlap_in_period(notice_seg, find_col(notice_seg, "dor"), find_col(notice_seg, "lwd"))
+notice_f = notice_seg
 
 pip_seg = filter_tracker(pip_df)
 pip_seg = apply_pip_status(pip_seg)
-pip_start_col = find_col(pip_seg, "pip_start") or find_col(pip_seg, "dor")
-pip_end_col = find_col(pip_seg, "pip_end") or find_col(pip_seg, "lwd")
-pip_f = overlap_in_period(pip_seg, pip_start_col, pip_end_col)
+pip_f = pip_seg
 
 exits_seg = filter_tracker(exits_df)
 exits_event_col = find_col(exits_seg, "lwd") or find_col(exits_seg, "dor")
-exits_f = point_in_period(exits_seg, exits_event_col)
 
 exit_col = roles.get("exit_date")
+doj_col = roles.get("doj")
 exited_all = df[df[exit_col].notna()] if exit_col and exit_col in df.columns else pd.DataFrame()
-exited_period = point_in_period(exited_all, exit_col) if period_start else exited_all
+
+# ==========================================================================
+# Sidebar — Joining Period (dedicated joining-date range — answers "how
+# many employees joined between X and Y").
+# ==========================================================================
+
+st.sidebar.header("Joining Period")
+use_joining_period = st.sidebar.checkbox(
+    "Filter by a specific joining date range", key="use_joining_period",
+    help="Shows exactly how many employees joined within the dates you pick.",
+)
+
+joining_period_start = joining_period_end = None
+joined_custom = pd.DataFrame()
+if use_joining_period:
+    join_dates_avail = df[doj_col].dropna() if doj_col and doj_col in df.columns else pd.Series(dtype="datetime64[ns]")
+    default_join_start = join_dates_avail.min().date() if not join_dates_avail.empty else today
+    default_join_end = join_dates_avail.max().date() if not join_dates_avail.empty else today
+    # Explicit wide bounds: st.date_input otherwise limits the year dropdown
+    # to roughly ±10 years around the *value*, which can cut off the
+    # current year if the earliest/latest joining date on record is old.
+    join_bound_min = min(default_join_start, datetime.date(1990, 1, 1))
+    join_bound_max = max(default_join_end, today)
+
+    jc1, jc2 = st.sidebar.columns(2)
+    joining_period_start = jc1.date_input("Join start date", value=default_join_start,
+                                           min_value=join_bound_min, max_value=join_bound_max, key="joining_period_start")
+    joining_period_end = jc2.date_input("Join end date", value=default_join_end,
+                                         min_value=join_bound_min, max_value=join_bound_max, key="joining_period_end")
+
+    if joining_period_start > joining_period_end:
+        st.sidebar.error("Join start date is after join end date.")
+    elif doj_col and doj_col in df.columns:
+        joined_custom = _point_in_range(df, doj_col, joining_period_start, joining_period_end)
+
+    st.sidebar.metric("Joiners in this range", len(joined_custom))
+
+# ==========================================================================
+# Sidebar — Exit Period (dedicated exit-date range — answers "how many
+# employees left between X and Y". Also scopes the Exit Tracker sheet,
+# exits_f, when active.)
+# ==========================================================================
+
+st.sidebar.header("Exit Period")
+use_exit_period = st.sidebar.checkbox(
+    "Filter by a specific exit date range", key="use_exit_period",
+    help="Shows exactly how many employees left within the dates you pick.",
+)
+
+exit_period_start = exit_period_end = None
+exited_custom = pd.DataFrame()
+exits_f = exits_seg
+if use_exit_period:
+    exit_dates_avail = df[exit_col].dropna() if exit_col and exit_col in df.columns else pd.Series(dtype="datetime64[ns]")
+    default_exit_start = exit_dates_avail.min().date() if not exit_dates_avail.empty else today
+    default_exit_end = exit_dates_avail.max().date() if not exit_dates_avail.empty else today
+    # Explicit wide bounds: st.date_input otherwise limits the year dropdown
+    # to roughly ±10 years around the *value*, which can cut off the
+    # current year if the earliest/latest exit on record is old.
+    exit_bound_min = min(default_exit_start, datetime.date(1990, 1, 1))
+    exit_bound_max = max(default_exit_end, today)
+
+    ec1, ec2 = st.sidebar.columns(2)
+    exit_period_start = ec1.date_input("Exit start date", value=default_exit_start,
+                                        min_value=exit_bound_min, max_value=exit_bound_max, key="exit_period_start")
+    exit_period_end = ec2.date_input("Exit end date", value=default_exit_end,
+                                      min_value=exit_bound_min, max_value=exit_bound_max, key="exit_period_end")
+
+    if exit_period_start > exit_period_end:
+        st.sidebar.error("Exit start date is after exit end date.")
+    else:
+        if exit_col and exit_col in df.columns:
+            exited_custom = _point_in_range(df, exit_col, exit_period_start, exit_period_end)
+        exits_f = _point_in_range(exits_seg, exits_event_col, exit_period_start, exit_period_end)
+
+    st.sidebar.metric("Exits in this range", len(exited_custom))
+
+exited_period = exited_custom if use_exit_period else exited_all
+
+MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+
+# ==========================================================================
+# Sidebar — Birthdays (month-only filter, calculated from Date of Birth)
+# ==========================================================================
+
+dob_col = roles.get("dob")
+st.sidebar.header("Birthdays")
+if dob_col and dob_col in df.columns:
+    birthday_month = st.sidebar.selectbox(
+        "Birthday month", ["All"] + MONTH_NAMES, index=today.month, key="birthday_month",
+    )
+else:
+    birthday_month = "All"
+    st.sidebar.caption("No Date of Birth column detected in the Employee Master.")
+
+birthday_df = pd.DataFrame()
+if dob_col and dob_col in df.columns:
+    valid_dob = df[dob_col].notna()
+    if birthday_month == "All":
+        birthday_df = df[valid_dob]
+    else:
+        month_num = MONTH_NAMES.index(birthday_month) + 1
+        birthday_df = df[valid_dob & (df[dob_col].dt.month == month_num)]
+
+# ==========================================================================
+# Sidebar — Service Tenure (5/10/15-year anniversaries, month-only filter,
+# calculated from Date of Joining)
+# ==========================================================================
+
+st.sidebar.header("Service Tenure")
+if doj_col and doj_col in df.columns:
+    tenure_month = st.sidebar.selectbox(
+        "Anniversary month", ["All"] + MONTH_NAMES, index=today.month, key="tenure_month",
+    )
+else:
+    tenure_month = "All"
+    st.sidebar.caption("No Date of Joining column detected in the Employee Master.")
+
+tenure_milestone_df = pd.DataFrame()
+if doj_col and doj_col in df.columns:
+    active_mask = df[exit_col].isna() if exit_col and exit_col in df.columns else pd.Series(True, index=df.index)
+    tenure_base = df[active_mask & df[doj_col].notna()].copy()
+    if tenure_month != "All":
+        month_num = MONTH_NAMES.index(tenure_month) + 1
+        tenure_base = tenure_base[tenure_base[doj_col].dt.month == month_num]
+    tenure_base["Milestone (Years)"] = today.year - tenure_base[doj_col].dt.year
+    tenure_milestone_df = tenure_base[tenure_base["Milestone (Years)"].isin([5, 10, 15])]
 
 st.sidebar.divider()
-st.sidebar.caption("Build: v6.0 — KPIs, PIP status filter, dept attrition, trends")
+st.sidebar.caption("Build: v7.1 — Fixed NaT date-comparison crash; hard-locked Vertical filter to Motivity Labs only, no exceptions")
 
 # ==========================================================================
 # Core figures (kept for use in section headers/captions below — the old
@@ -385,16 +589,12 @@ st.sidebar.caption("Build: v6.0 — KPIs, PIP status filter, dept attrition, tre
 # ==========================================================================
 
 hc = len(df)
-attrition_count = len(exited_period)
-attrition_rate = pct(attrition_count, hc)
-period_label = f" ({preset})" if period_start else ""
 
 # Active headcount = filtered employees with no recorded exit date
 exited_mask = df[exit_col].notna() if exit_col and exit_col in df.columns else pd.Series(False, index=df.index)
 active_hc = int((~exited_mask).sum())
 
 # Average tenure (years), open-ended employees measured to today
-doj_col = roles.get("doj")
 avg_tenure_years = None
 if doj_col and doj_col in df.columns:
     end_dates = df[exit_col].copy() if exit_col and exit_col in df.columns else pd.Series(pd.NaT, index=df.index)
@@ -404,10 +604,78 @@ if doj_col and doj_col in df.columns:
     if not tenure_days.empty:
         avg_tenure_years = round(tenure_days.mean() / 365.25, 1)
 
-# New hires in the selected period, and net headcount change
-new_hires_df = point_in_period(df, doj_col) if doj_col else pd.DataFrame()
-new_hires = len(new_hires_df)
-net_change = new_hires - attrition_count
+# Early attrition — of the employees who exited within the current
+# filter/period selection, how many left within their first 6 months?
+# A far more actionable signal than a raw attrition % on its own.
+early_attrition_count = None
+early_attrition_pct_of_exits = None
+early_attrition_df = pd.DataFrame()
+if doj_col and exit_col and doj_col in exited_period.columns and exit_col in exited_period.columns and not exited_period.empty:
+    tenure_at_exit_days = (exited_period[exit_col] - exited_period[doj_col]).dt.days
+    early_mask = tenure_at_exit_days.notna() & (tenure_at_exit_days >= 0) & (tenure_at_exit_days <= 182)
+    early_attrition_df = exited_period[early_mask]
+    early_attrition_count = int(early_mask.sum())
+    early_attrition_pct_of_exits = pct(early_attrition_count, len(exited_period))
+
+# Actual attrition % YTD — exits from Jan 1 of this year to today, divided
+# by the average headcount over that same window (headcount at the start
+# of the year + headcount today, divided by two). This is independent of
+# Exit Period/Joining Period toggles — it's always the
+# calendar-year-to-date figure for whatever segment filters are active.
+ytd_attrition_pct = None
+ytd_exits = None
+ytd_exits_df = pd.DataFrame()
+if doj_col and exit_col and doj_col in df.columns and exit_col in df.columns:
+    ytd_start = datetime.date(today.year, 1, 1)
+
+    def _headcount_as_of(as_of_date):
+        as_of_ts = pd.Timestamp(as_of_date)
+        joined = df[doj_col] <= as_of_ts
+        exited_by_then = df[exit_col] <= as_of_ts
+        return int((joined & ~exited_by_then).sum())
+
+    hc_start_of_year = _headcount_as_of(ytd_start - datetime.timedelta(days=1))
+    hc_today = _headcount_as_of(today)
+    ytd_avg_hc = (hc_start_of_year + hc_today) / 2
+
+    ytd_exits_df = _point_in_range(df, exit_col, ytd_start, today)
+    ytd_exits = len(ytd_exits_df)
+    if ytd_avg_hc > 0:
+        ytd_attrition_pct = round(100 * ytd_exits / ytd_avg_hc, 1)
+
+# ==========================================================================
+# Sticky main header — the primary at-a-glance output for whatever filters
+# are currently selected (vertical, department/location/etc., PIP status,
+# Exit Period, Joining Period). Recomputes on every filter
+# change and stays pinned at the top of the page so it never needs
+# scrolling to find.
+# ==========================================================================
+
+header_items = [("Headcount", hc, "overview"), ("Active", active_hc, "overview")]
+if avg_tenure_years is not None:
+    header_items.append(("Avg tenure", f"{avg_tenure_years} yrs", "overview"))
+if early_attrition_count is not None:
+    header_items.append(("Early attrition (≤6mo)", f"{early_attrition_count} ({early_attrition_pct_of_exits}% of exits)", "reasons"))
+if ytd_attrition_pct is not None:
+    header_items.append(("Attrition % YTD", f"{ytd_attrition_pct}% ({ytd_exits})", "reasons"))
+if not notice_df.empty:
+    header_items.append(("On notice", len(notice_f), "notice-pip"))
+if not pip_df.empty:
+    header_items.append(("On PIP", len(pip_f), "notice-pip"))
+if use_exit_period:
+    header_items.append((f"Exits {exit_period_start} → {exit_period_end}", len(exited_custom), "exits"))
+if use_joining_period:
+    header_items.append((f"Joiners {joining_period_start} → {joining_period_end}", len(joined_custom), "joiners"))
+if dob_col:
+    header_items.append((f"Birthdays ({birthday_month})", len(birthday_df), "birthdays"))
+if doj_col:
+    header_items.append((f"Service Tenure ({tenure_month})", len(tenure_milestone_df), "tenure"))
+
+header_html = "".join(
+    f'<a class="mh-item" href="#{anchor}"><div class="mh-label">{label}</div><div class="mh-value">{value}</div></a>'
+    for label, value, anchor in header_items
+)
+st.markdown(f'<div class="main-header-bar">{header_html}</div>', unsafe_allow_html=True)
 
 st.divider()
 
@@ -416,7 +684,9 @@ st.divider()
 # so everything is visible with one scroll instead of clicking around.
 # Each section only renders its metric line for values that are actually
 # available, instead of a fixed 9-box grid that shows 0/— for anything
-# undetected.
+# undetected. The header boxes above link straight to these sections via
+# their anchors, and the Joiners section only exists at all when the
+# Joining Period filter is switched on, to keep the page clutter-free.
 # ==========================================================================
 
 tab_overview = st.container()
@@ -425,7 +695,16 @@ tab_reasons = st.container()
 st.divider()
 tab_np = st.container()
 st.divider()
+if use_joining_period:
+    tab_joiners = st.container()
+    st.divider()
+else:
+    tab_joiners = None
 tab_exits = st.container()
+st.divider()
+tab_birthdays = st.container()
+st.divider()
+tab_tenure = st.container()
 st.divider()
 tab_trends = st.container()
 
@@ -434,20 +713,7 @@ tab_trends = st.container()
 # ==========================================================================
 
 with tab_overview:
-    st.header("🏠 Overview")
-
-    glance_bits = [f"**Headcount:** {hc}", f"**Active:** {active_hc}",
-                    f"**Attrition{period_label}:** {attrition_rate}% ({attrition_count})"]
-    if avg_tenure_years is not None:
-        glance_bits.append(f"**Avg tenure:** {avg_tenure_years} yrs")
-    if doj_col:
-        glance_bits.append(f"**New hires{period_label}:** {new_hires}")
-        glance_bits.append(f"**Net change{period_label}:** {net_change:+d}")
-    if not notice_df.empty:
-        glance_bits.append(f"**On notice:** {len(notice_f)}")
-    if not pip_df.empty:
-        glance_bits.append(f"**On PIP:** {len(pip_f)}")
-    st.caption(" · ".join(glance_bits))
+    st.header("🏠 Overview", anchor="overview")
 
     gender_col = roles.get("gender")
     dept_col = roles.get("department")
@@ -474,7 +740,37 @@ with tab_overview:
                         "filtered_employees.csv", "text/csv")
 
 with tab_reasons:
-    st.header("📌 Reasons & Managers")
+    st.header("📌 Reasons & Managers", anchor="reasons")
+
+    # --- Early Attrition: employees who left within 6 months of joining ---
+    if early_attrition_count is not None:
+        st.subheader("Early Attrition (≤ 6 months)")
+        st.metric("Left within 6 months of joining", f"{early_attrition_count} ({early_attrition_pct_of_exits}% of exits)",
+                   help=f"{early_attrition_count} of the {len(exited_period)} exits in the current filter/period "
+                        f"selection left within 182 days of joining.")
+        st.dataframe(early_attrition_df, use_container_width=True, height=300)
+        st.download_button(
+            "Download early leavers (CSV)",
+            early_attrition_df.to_csv(index=False).encode("utf-8"),
+            "early_attrition.csv", "text/csv", key="dl_early_attrition",
+        )
+        st.divider()
+
+    # --- Attrition % YTD: total exits + rate from Jan 1 to today ---
+    if ytd_attrition_pct is not None:
+        st.subheader(f"Attrition % — Year to Date ({today.year})")
+        st.metric("YTD attrition rate", f"{ytd_attrition_pct}% ({ytd_exits} exits)",
+                   help=f"{ytd_exits} exits from Jan 1, {today.year} to today, divided by average headcount "
+                        f"(headcount at start of year + headcount today, ÷ 2) for the currently selected segment filters. "
+                        f"Independent of the Exit Period/Joining Period toggles.")
+        st.dataframe(ytd_exits_df, use_container_width=True, height=300)
+        st.download_button(
+            "Download YTD leavers (CSV)",
+            ytd_exits_df.to_csv(index=False).encode("utf-8"),
+            "ytd_attrition.csv", "text/csv", key="dl_ytd_attrition",
+        )
+        st.divider()
+
     if exited_period.empty:
         st.info("No exited employees in the current filter/period selection.")
     else:
@@ -530,9 +826,7 @@ with tab_reasons:
             st.info("No department field detected in this dataset.")
 
 with tab_np:
-    st.header("📋 Notice & PIP")
-    if period_start:
-        st.caption(f"Overlapping **{preset}** ({period_start} to {period_end}).")
+    st.header("📋 Notice & PIP", anchor="notice-pip")
     if selected_verticals:
         st.caption(f"Vertical filter active: **{', '.join(selected_verticals)}**")
 
@@ -555,10 +849,38 @@ with tab_np:
                 st.plotly_chart(fig, use_container_width=True)
             st.dataframe(pip_f, use_container_width=True, height=420)
 
+if tab_joiners is not None:
+    with tab_joiners:
+        st.header("🆕 New Joiners", anchor="joiners")
+        st.subheader(f"Joined between {joining_period_start} and {joining_period_end}")
+        st.metric("Employees who joined in this range", len(joined_custom))
+        if joined_custom.empty:
+            st.info("No employees joined in the selected range.")
+        else:
+            st.dataframe(joined_custom, use_container_width=True, height=350)
+            st.download_button(
+                "Download joiners in range (CSV)",
+                joined_custom.to_csv(index=False).encode("utf-8"),
+                "joiners_in_range.csv", "text/csv", key="dl_joining_period",
+            )
+
 with tab_exits:
-    st.header("🚪 Exits")
-    if period_start:
-        st.caption(f"Exits within **{preset}** ({period_start} to {period_end}).")
+    st.header("🚪 Exits", anchor="exits")
+
+    if use_exit_period:
+        st.subheader(f"Exits between {exit_period_start} and {exit_period_end}")
+        st.metric("Employees who left in this range", len(exited_custom))
+        if exited_custom.empty:
+            st.info("No employees exited in the selected range.")
+        else:
+            st.dataframe(exited_custom, use_container_width=True, height=300)
+            st.download_button(
+                "Download exits in range (CSV)",
+                exited_custom.to_csv(index=False).encode("utf-8"),
+                "exits_in_range.csv", "text/csv", key="dl_exit_period",
+            )
+        st.divider()
+
     if selected_verticals:
         st.caption(f"Vertical filter active: **{', '.join(selected_verticals)}**")
 
@@ -580,8 +902,45 @@ with tab_exits:
             st.plotly_chart(fig, use_container_width=True)
         st.dataframe(exits_f, use_container_width=True, height=420)
 
+with tab_birthdays:
+    st.header("🎂 Birthdays", anchor="birthdays")
+    if not dob_col or dob_col not in df.columns:
+        st.info("No Date of Birth column detected in the Employee Master, so birthdays can't be shown.")
+    else:
+        st.caption(f"Showing birthdays for: **{birthday_month}**")
+        if birthday_df.empty:
+            st.info("No birthdays found for the selected month.")
+        else:
+            st.subheader(f"Employees with a birthday in {birthday_month} ({len(birthday_df)})")
+            st.dataframe(birthday_df, use_container_width=True, height=350)
+            st.download_button(
+                "Download birthdays (CSV)",
+                birthday_df.to_csv(index=False).encode("utf-8"),
+                "birthdays.csv", "text/csv", key="dl_birthdays",
+            )
+
+with tab_tenure:
+    st.header("🎉 Service Tenure Milestones (5 / 10 / 15 Years)", anchor="tenure")
+    if not doj_col or doj_col not in df.columns:
+        st.info("No Date of Joining column detected in the Employee Master, so service tenure milestones can't be calculated.")
+    else:
+        st.caption(f"Showing 5/10/15-year anniversaries for: **{tenure_month}** (active employees only)")
+        if tenure_milestone_df.empty:
+            st.info("No employees hitting a 5, 10, or 15-year milestone in the selected month.")
+        else:
+            for milestone in (5, 10, 15):
+                sub = tenure_milestone_df[tenure_milestone_df["Milestone (Years)"] == milestone]
+                if not sub.empty:
+                    st.subheader(f"{milestone}-Year Anniversaries ({len(sub)})")
+                    st.dataframe(sub, use_container_width=True, height=250)
+            st.download_button(
+                "Download service tenure milestones (CSV)",
+                tenure_milestone_df.to_csv(index=False).encode("utf-8"),
+                "service_tenure_milestones.csv", "text/csv", key="dl_tenure",
+            )
+
 with tab_trends:
-    st.header("📈 Trends")
+    st.header("📈 Trends", anchor="trends")
     st.subheader("Monthly Trend (Summary Sheet)")
     summary_seg = apply_vertical(summary_df) if not summary_df.empty else summary_df
 
