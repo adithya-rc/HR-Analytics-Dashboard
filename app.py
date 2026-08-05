@@ -566,6 +566,24 @@ def _resigned_in_range(tdf, range_start, range_end):
     return _point_in_range(resigned, exit_col, range_start, range_end)
 
 
+def _active_as_of(tdf, as_of_date):
+    """True point-in-time active roster on a given date: joined on/before
+    that date, and not (Resigned with an exit date on/before that date).
+    Unlike df_period (event-window) or 'currently Resigned' (today's live
+    status), this reflects who was actually on the books on that specific
+    day — the stable, validated number for a recurring headcount check."""
+    if tdf.empty or not doj_col or not exit_col or doj_col not in tdf.columns or exit_col not in tdf.columns:
+        return tdf.iloc[0:0]
+    as_of_ts = pd.Timestamp(as_of_date)
+    joined_by = tdf[doj_col] <= as_of_ts
+    exited_by = is_resigned_mask(tdf) & (tdf[exit_col] <= as_of_ts)
+    return tdf[joined_by & ~exited_by]
+
+
+def _last_friday_on_or_before(a_date):
+    return a_date - datetime.timedelta(days=(a_date.weekday() - 4) % 7)
+
+
 exited_all = df[is_resigned_mask(df)] if not df.empty else pd.DataFrame()
 
 # ==========================================================================
@@ -828,10 +846,13 @@ st.sidebar.caption("Build: v7.1 — Fixed NaT date-comparison crash; hard-locked
 
 hc = len(df_period)
 
-# Active headcount = filtered employees (in-window, if the Master Date
-# Filter is on) with no recorded exit date
-exited_mask = is_resigned_mask(df_period)
-active_hc = int((~exited_mask).sum())
+# Active headcount = a stable point-in-time count as of last Friday (not
+# "today's live status", and not tied to df_period/Master Date Filter).
+# Matches the number used every week for the validation meeting, so it
+# doesn't drift day-to-day as new resignations get logged, and doesn't
+# change just because a different Master Date Filter window is selected.
+_hdr_last_friday = _last_friday_on_or_before(today)
+active_hc = len(_active_as_of(df, _hdr_last_friday))
 
 # Average tenure (years), open-ended employees measured to today
 avg_tenure_years = None
@@ -899,7 +920,7 @@ if doj_col and exit_col and doj_col in df.columns and exit_col in df.columns:
 # scrolling to find.
 # ==========================================================================
 
-header_items = [("Headcount", hc, "overview"), ("Active", active_hc, "overview")]
+header_items = [("Headcount", hc, "overview"), (f"Active (as of {_hdr_last_friday})", active_hc, "overview")]
 if avg_tenure_years is not None:
     header_items.append(("Avg tenure", f"{avg_tenure_years} yrs", "overview"))
 if early_attrition_count is not None:
@@ -938,6 +959,8 @@ st.divider()
 # Joining Period filter is switched on, to keep the page clutter-free.
 # ==========================================================================
 
+tab_snapshot = st.container()
+st.divider()
 tab_overview = st.container()
 st.divider()
 tab_reasons = st.container()
@@ -960,6 +983,80 @@ tab_trends = st.container()
 # ==========================================================================
 # SECTION: Overview — Gender diversity + headcount breakdowns
 # ==========================================================================
+
+with tab_snapshot:
+    st.header("📋 Weekly Validation Snapshot", anchor="snapshot")
+    st.caption("Everything for a recurring headcount check in one place: Active Headcount **as of** a chosen "
+                "date (a true point-in-time count — not who joined/exited in a window), current PIP, and "
+                "exits/joiners for the week ending on that date. Respects your Vertical/segment filters above; "
+                "independent of the Master Date Filter.")
+
+    _default_friday = _last_friday_on_or_before(today)
+    snap_c1, snap_c2 = st.columns([1, 2])
+    with snap_c1:
+        as_of_date = st.date_input(
+            "Snapshot as-of date", value=_default_friday,
+            help="Active Headcount is calculated as of this date. Defaults to the most recent Friday, "
+                 "so opening this on a Tuesday needs no adjustment.",
+            key="snapshot_as_of",
+        )
+    week_start = as_of_date - datetime.timedelta(days=6)
+    with snap_c2:
+        st.caption(f"'Last week' = **{week_start} → {as_of_date}** (the 7 days ending on the as-of date). "
+                    f"Move the as-of date above if your reporting week runs differently.")
+
+    if doj_col and exit_col and doj_col in df.columns and exit_col in df.columns:
+        snap_active_df = _active_as_of(df, as_of_date)
+        snap_active_hc = len(snap_active_df)
+        snap_exits_df = _resigned_in_range(df, week_start, as_of_date)
+        snap_joiners_df = _point_in_range(df, doj_col, week_start, as_of_date)
+    else:
+        snap_active_hc = None
+        snap_exits_df = pd.DataFrame()
+        snap_joiners_df = pd.DataFrame()
+
+    snap_pip_df = pip_f  # PIP is inherently "current" — never date-scoped
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(f"Active Headcount (as of {as_of_date})", snap_active_hc if snap_active_hc is not None else "—")
+    m2.metric("Currently on PIP", len(snap_pip_df))
+    m3.metric("Exits last week", len(snap_exits_df))
+    m4.metric("New Joiners last week", len(snap_joiners_df))
+
+    with st.expander(f"Exits last week ({week_start} → {as_of_date}) — {len(snap_exits_df)}"):
+        if snap_exits_df.empty:
+            st.info("No exits in this window.")
+        else:
+            st.dataframe(snap_exits_df, use_container_width=True, height=250)
+
+    with st.expander(f"New Joiners last week ({week_start} → {as_of_date}) — {len(snap_joiners_df)}"):
+        if snap_joiners_df.empty:
+            st.info("No joiners in this window.")
+        else:
+            st.dataframe(snap_joiners_df, use_container_width=True, height=250)
+
+    with st.expander(f"Currently on PIP — {len(snap_pip_df)}"):
+        if snap_pip_df.empty:
+            st.info("No one currently on PIP.")
+        else:
+            st.dataframe(snap_pip_df, use_container_width=True, height=250)
+
+    _snap_exits_out = snap_exits_df.copy()
+    if not _snap_exits_out.empty:
+        _snap_exits_out.insert(0, "Snapshot Category", "Exit (last week)")
+    _snap_joiners_out = snap_joiners_df.copy()
+    if not _snap_joiners_out.empty:
+        _snap_joiners_out.insert(0, "Snapshot Category", "Joiner (last week)")
+    _snap_pip_out = snap_pip_df.copy()
+    if not _snap_pip_out.empty:
+        _snap_pip_out.insert(0, "Snapshot Category", "Currently on PIP")
+    _snap_combined = pd.concat([_snap_exits_out, _snap_joiners_out, _snap_pip_out], ignore_index=True, sort=False)
+    if not _snap_combined.empty:
+        st.download_button(
+            "Download meeting pack (CSV) — exits, joiners, PIP",
+            _snap_combined.to_csv(index=False).encode("utf-8"),
+            f"weekly_snapshot_{as_of_date}.csv", "text/csv",
+        )
 
 with tab_overview:
     st.header("🏠 Overview", anchor="overview")
