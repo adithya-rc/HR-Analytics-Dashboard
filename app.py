@@ -1,5 +1,5 @@
 """
-HR Analytics Dashboard
+ML HR Dashboard
 =======================
 Upload your Employee Master workbook and Attrition Tracker workbook
 (drop both into the same uploader). Curated views only.
@@ -14,7 +14,7 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="HR Analytics Dashboard", layout="wide", page_icon="📊")
+st.set_page_config(page_title="ML HR Dashboard", layout="wide", page_icon="📊")
 
 PALETTE = px.colors.qualitative.Set2
 
@@ -98,7 +98,7 @@ h1, h2, h3 { scroll-margin-top: 92px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 HR Analytics Dashboard")
+st.title("📊 ML HR Dashboard")
 
 # ==========================================================================
 # Loading
@@ -763,7 +763,7 @@ if use_master_period:
         # selected elsewhere. notice_f and pip_f intentionally stay as set
         # above (full current on-notice list; current In Progress PIPs),
         # un-scoped by the Master Date Filter. For a historical "who was on
-        # PIP as of a past date" question, use the Weekly Snapshot's own
+        # PIP as of a past date" question, use the Data Snapshot section's
         # as-of-date control instead — that's built for exactly this.
 
 use_master_active = use_master_period and master_period_start is not None and master_period_start <= master_period_end
@@ -1088,11 +1088,7 @@ tab_trends = st.container()
 # ==========================================================================
 
 with tab_snapshot:
-    st.header("📋 Weekly Validation Snapshot", anchor="snapshot")
-    st.caption("Everything for a recurring headcount check in one place: Active Headcount **as of** a chosen "
-                "date (a true point-in-time count — not who joined/exited in a window), current PIP, and "
-                "exits/joiners for the week ending on that date. Respects your Vertical/segment filters above; "
-                "independent of the Master Date Filter.")
+    st.header("📋 Weekly Data Snapshot", anchor="snapshot")
 
     _default_friday = _last_friday_on_or_before(today)
     snap_c1, snap_c2 = st.columns([1, 2])
@@ -1118,13 +1114,8 @@ with tab_snapshot:
         snap_exits_df = pd.DataFrame()
         snap_joiners_df = pd.DataFrame()
 
-    snap_pip_df = _pip_active_as_of(pip_seg_all_status, as_of_date)
-    if pip_start_col:
-        _pip_label = f"On PIP (as of {as_of_date})"
-    elif pip_status_col:
-        _pip_label = "Currently on PIP (In Progress) — no PIP Start Date, so this can only show today's status"
-    else:
-        _pip_label = "Currently on PIP (no Review Status or PIP Start Date column found)"
+    snap_pip_df = _pip_in_progress(pip_seg_all_status)
+    _pip_label = "On PIP (In Progress)" if pip_status_col else "On PIP (no Review Status column found)"
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric(f"Active Headcount (as of {as_of_date})", snap_active_hc if snap_active_hc is not None else "—")
@@ -1328,12 +1319,8 @@ with tab_reasons:
             st.info("No reporting-manager field detected in this dataset.")
 
     with c2:
-        # Sub Department gives a finer-grained breakdown than Department;
-        # prefer it when the sheet has one, and fall back to Department
-        # only if there's no Sub Department column at all.
-        sub_dept_col = roles.get("sub_department")
-        dept_col_for_table = sub_dept_col or roles.get("department")
-        st.subheader(f"{dept_col_for_table} Attrition Rate" if dept_col_for_table else "Department Attrition Rate")
+        dept_col_for_table = roles.get("sub_department") or roles.get("department")
+        st.subheader("Department Attrition Rate")
         if dept_col_for_table and dept_col_for_table in df_period.columns and df_period[dept_col_for_table].notna().any():
             hc_by_dept = df_period[dept_col_for_table].value_counts()
             exit_by_dept = exited_period[dept_col_for_table].value_counts() if not exited_period.empty else pd.Series(dtype=int)
@@ -1355,7 +1342,7 @@ with tab_np:
     if use_master_active:
         st.caption(f"Master date range active: **{master_period_start} → {master_period_end}** — this doesn't "
                     f"affect On Notice Period or PIP below; both always show the current list (PIP: In Progress "
-                    f"only). For a historical PIP question ('who was on PIP 3 months ago'), use the Weekly "
+                    f"only). For a historical PIP question ('who was on PIP 3 months ago'), use the Data "
                     f"Snapshot section's as-of-date control instead.")
 
     c1, c2 = st.columns(2)
