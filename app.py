@@ -515,6 +515,24 @@ def apply_pip_status(tdf):
         return tdf
     return tdf[tdf[pip_status_col].astype(str).isin(selected_pip_status)]
 
+
+def _pip_in_progress(tdf):
+    """PIP rows that are actually still ongoing, per the Review Status
+    column — this is what 'Currently on PIP' should mean, not every PIP
+    record ever raised (which would include ones already Completed/
+    Passed/Failed/Closed)."""
+    if tdf.empty or not pip_status_col or pip_status_col not in tdf.columns:
+        return tdf
+    in_progress_mask = tdf[pip_status_col].astype(str).str.contains("progress", case=False, na=False)
+    if in_progress_mask.any():
+        return tdf[in_progress_mask]
+    # No status explicitly says "In Progress" — fall back to excluding
+    # anything that reads as a closed/terminal outcome, so a workbook using
+    # different wording (e.g. "Ongoing", "Active") doesn't just come back empty.
+    closed_kw = "complete|closed|pass|fail|terminat|exit|revoke|end"
+    closed_mask = tdf[pip_status_col].astype(str).str.contains(closed_kw, case=False, na=False, regex=True)
+    return tdf[~closed_mask]
+
 today = datetime.date.today()
 
 def _point_in_range(tdf, date_col, range_start, range_end):
@@ -531,6 +549,7 @@ notice_seg = filter_tracker(notice_df)
 notice_f = notice_seg
 
 pip_seg = filter_tracker(pip_df)
+pip_seg_all_status = pip_seg
 pip_seg = apply_pip_status(pip_seg)
 pip_f = pip_seg
 
@@ -1015,11 +1034,12 @@ with tab_snapshot:
         snap_exits_df = pd.DataFrame()
         snap_joiners_df = pd.DataFrame()
 
-    snap_pip_df = pip_f  # PIP is inherently "current" — never date-scoped
+    snap_pip_df = _pip_in_progress(pip_seg_all_status)  # always "In Progress" — never date-scoped, never affected by the sidebar's manual Review Status picker
+    _pip_label = "Currently on PIP (In Progress)" if pip_status_col else "Currently on PIP (no Review Status column found)"
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric(f"Active Headcount (as of {as_of_date})", snap_active_hc if snap_active_hc is not None else "—")
-    m2.metric("Currently on PIP", len(snap_pip_df))
+    m2.metric(_pip_label, len(snap_pip_df))
     m3.metric("Exits last week", len(snap_exits_df))
     m4.metric("New Joiners last week", len(snap_joiners_df))
 
@@ -1035,9 +1055,9 @@ with tab_snapshot:
         else:
             st.dataframe(snap_joiners_df, use_container_width=True, height=250)
 
-    with st.expander(f"Currently on PIP — {len(snap_pip_df)}"):
+    with st.expander(f"{_pip_label} — {len(snap_pip_df)}"):
         if snap_pip_df.empty:
-            st.info("No one currently on PIP.")
+            st.info("No one currently on an In Progress PIP.")
         else:
             st.dataframe(snap_pip_df, use_container_width=True, height=250)
 
@@ -1049,7 +1069,7 @@ with tab_snapshot:
         _snap_joiners_out.insert(0, "Snapshot Category", "Joiner (last week)")
     _snap_pip_out = snap_pip_df.copy()
     if not _snap_pip_out.empty:
-        _snap_pip_out.insert(0, "Snapshot Category", "Currently on PIP")
+        _snap_pip_out.insert(0, "Snapshot Category", _pip_label)
     _snap_combined = pd.concat([_snap_exits_out, _snap_joiners_out, _snap_pip_out], ignore_index=True, sort=False)
     if not _snap_combined.empty:
         st.download_button(
