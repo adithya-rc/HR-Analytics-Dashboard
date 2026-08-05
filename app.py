@@ -165,10 +165,15 @@ ROLE_KEYWORDS = {
     "exit_date":     ["date of exit", "exit date", "dor", "lwd", "last working day", "separation date"],
     "status":        ["employee status", "employment status", "status"],
     "department":    ["department", "dept"],
+    "sub_department": ["sub department", "sub-department", "subdepartment"],
     "division":      ["division"],
     "vertical":      ["vertical", "business unit"],
     "location":      ["location", "office", "site", "city"],
-    "manager":       ["manager", "reporting manager", "l1 manager", "reporting to"],
+    # Most specific first: "L1 Manager"/"Reporting Manager" should win over
+    # a merely-generic "manager" substring match (which could otherwise
+    # land on something like "Dotted Line Manager" or "Skip Level Manager"
+    # if one happens to appear earlier in the column order).
+    "manager":       ["l1 manager", "reporting manager", "manager", "reporting to"],
     "designation":   ["designation", "title", "position"],
     "reason":        ["reason"],
     "attrition_type": ["attrition type"],
@@ -207,6 +212,44 @@ def first_date_col(df, exclude=()):
         if pd.api.types.is_datetime64_any_dtype(df[c]):
             return c
     return None
+
+
+def clickable_chart(fig, source_df, category_col, key, chart_type="bar"):
+    """Render a Plotly chart with click-to-drill-down: clicking a bar or
+    pie slice shows the underlying records for that category right below
+    the chart. Click the same bar/slice again to clear the table."""
+    event = st.plotly_chart(fig, use_container_width=True, key=key,
+                             on_select="rerun", selection_mode="points")
+    points = (event or {}).get("selection", {}).get("points", [])
+    if points:
+        pt = points[0]
+        # Plotly's selection payload varies by trace type; try the keys
+        # most likely to hold the clicked category name, in order.
+        candidate_keys = ["label", "y", "x"] if chart_type == "pie" else ["y", "label", "x"]
+        clicked_value = next((pt[k] for k in candidate_keys if pt.get(k) is not None), None)
+        if clicked_value is not None and category_col and source_df is not None and category_col in source_df.columns:
+            matches = source_df[source_df[category_col].astype(str) == str(clicked_value)]
+            st.caption(f"🔎 {len(matches)} record(s) where **{category_col} = {clicked_value}** "
+                        f"— click the same bar/slice again to clear.")
+            st.dataframe(matches, use_container_width=True,
+                         height=min(350, max(120, 38 * min(len(matches), 8) + 40)))
+
+
+def clickable_table(display_df, source_df, category_col, key, height=380):
+    """Render a summary table indexed by a category (e.g. Reporting Manager
+    or Department) with click-to-drill-down: selecting a row shows the
+    underlying employee records for that category right below the table.
+    Click the same row again to clear."""
+    event = st.dataframe(display_df, use_container_width=True, height=height, key=key,
+                          on_select="rerun", selection_mode="single-row")
+    sel_rows = (event or {}).get("selection", {}).get("rows", [])
+    if sel_rows and category_col and source_df is not None and category_col in source_df.columns:
+        clicked_value = display_df.index[sel_rows[0]]
+        matches = source_df[source_df[category_col].astype(str) == str(clicked_value)]
+        st.caption(f"🔎 {len(matches)} record(s) where **{category_col} = {clicked_value}** "
+                    f"— click the same row again to clear.")
+        st.dataframe(matches, use_container_width=True,
+                     height=min(350, max(120, 38 * min(len(matches), 8) + 40)))
 
 
 def clean_series(df, col, min_opts=2, max_opts=400):
@@ -501,6 +544,8 @@ def filter_tracker(tdf):
 # ==========================================================================
 
 pip_status_col = find_col(pip_df, "pip_status")
+pip_start_col = find_col(pip_df, "pip_start")
+pip_end_col = find_col(pip_df, "pip_end")
 pip_status_opts = clean_series(pip_df, pip_status_col) if not pip_df.empty else []
 selected_pip_status = []
 if pip_status_opts:
@@ -517,10 +562,12 @@ def apply_pip_status(tdf):
 
 
 def _pip_in_progress(tdf):
-    """PIP rows that are actually still ongoing, per the Review Status
-    column — this is what 'Currently on PIP' should mean, not every PIP
-    record ever raised (which would include ones already Completed/
-    Passed/Failed/Closed)."""
+    """PIP rows that are actually still ongoing RIGHT NOW, per the Review
+    Status column — this is what 'Currently on PIP' should mean, not every
+    PIP record ever raised (which would include ones already Completed/
+    Passed/Failed/Closed). Use _pip_active_as_of / _pip_active_in_range
+    instead for any historical ("as of a date" / "during a range")
+    question — status alone has no memory of when a PIP was actually open."""
     if tdf.empty or not pip_status_col or pip_status_col not in tdf.columns:
         return tdf
     in_progress_mask = tdf[pip_status_col].astype(str).str.contains("progress", case=False, na=False)
@@ -532,6 +579,47 @@ def _pip_in_progress(tdf):
     closed_kw = "complete|closed|pass|fail|terminat|exit|revoke|end"
     closed_mask = tdf[pip_status_col].astype(str).str.contains(closed_kw, case=False, na=False, regex=True)
     return tdf[~closed_mask]
+
+
+def _pip_effective_end(tdf):
+    """Each row's PIP end date for interval math: the actual Revoke/End
+    Date if recorded, otherwise 'still open' — represented as today, since
+    a PIP with no recorded end hasn't been closed out yet."""
+    today_ts = pd.Timestamp(datetime.date.today())
+    if pip_end_col and pip_end_col in tdf.columns:
+        return tdf[pip_end_col].fillna(today_ts)
+    return pd.Series(today_ts, index=tdf.index)
+
+
+def _pip_active_as_of(tdf, as_of_date):
+    """Was this person actively on PIP on a specific date? Proper interval
+    check: PIP Start Date <= as_of_date <= (Revoke Date or today, if still
+    open). Falls back to the current Review Status if there's no PIP Start
+    Date at all to build an interval from — which can only answer 'who is
+    on PIP right now', not a historical date."""
+    if tdf.empty:
+        return tdf
+    if not pip_start_col or pip_start_col not in tdf.columns:
+        return _pip_in_progress(tdf)
+    as_of_ts = pd.Timestamp(as_of_date)
+    started_by = tdf[pip_start_col] <= as_of_ts
+    not_yet_ended = _pip_effective_end(tdf) >= as_of_ts
+    return tdf[started_by & not_yet_ended]
+
+
+def _pip_active_in_range(tdf, range_start, range_end):
+    """Was this person on PIP at ANY point during [range_start, range_end]?
+    A true interval-overlap check — catches PIPs that started before the
+    range but are still running through it, not just ones that happened to
+    start inside the range (which was the previous, narrower behaviour).
+    Falls back to current Review Status if there's no PIP Start Date."""
+    if tdf.empty or range_start is None:
+        return tdf
+    if not pip_start_col or pip_start_col not in tdf.columns:
+        return _pip_in_progress(tdf)
+    range_start_ts, range_end_ts = pd.Timestamp(range_start), pd.Timestamp(range_end)
+    overlaps = (tdf[pip_start_col] <= range_end_ts) & (_pip_effective_end(tdf) >= range_start_ts)
+    return tdf[overlaps]
 
 today = datetime.date.today()
 
@@ -551,7 +639,7 @@ notice_f = notice_seg
 pip_seg = filter_tracker(pip_df)
 pip_seg_all_status = pip_seg
 pip_seg = apply_pip_status(pip_seg)
-pip_f = pip_seg
+pip_f = _pip_in_progress(pip_seg)
 
 exits_seg = filter_tracker(exits_df)
 exits_event_col = find_col(exits_seg, "lwd") or find_col(exits_seg, "dor")
@@ -670,19 +758,13 @@ if use_master_period:
         master_period_start = master_period_end = None
     else:
         st.sidebar.success(f"Master range active: **{master_period_start} → {master_period_end}**")
-        # Scope Notice/PIP to this window using the best available date
-        # column on each sheet: an explicit "Notice Period"/"PIP Start Date"
-        # role if one is mapped, otherwise the first datetime column that
-        # ISN'T the join date or exit date (both would give a misleading
-        # scope — e.g. filtering "who's currently on notice" by DOJ instead
-        # of by their actual notice date).
-        _exclude_dates = {c for c in (doj_col, exit_col) if c}
-        notice_date_col = find_col(notice_seg, "notice_date") or first_date_col(notice_seg, exclude=_exclude_dates)
-        if notice_date_col:
-            notice_f = _point_in_range(notice_seg, notice_date_col, master_period_start, master_period_end)
-        pip_date_col = find_col(pip_seg, "pip_start") or first_date_col(pip_seg, exclude=_exclude_dates)
-        if pip_date_col:
-            pip_f = _point_in_range(pip_seg, pip_date_col, master_period_start, master_period_end)
+        # Notice and PIP are both live/current statuses — neither should
+        # shrink or disappear just because an unrelated date range is
+        # selected elsewhere. notice_f and pip_f intentionally stay as set
+        # above (full current on-notice list; current In Progress PIPs),
+        # un-scoped by the Master Date Filter. For a historical "who was on
+        # PIP as of a past date" question, use the Weekly Snapshot's own
+        # as-of-date control instead — that's built for exactly this.
 
 use_master_active = use_master_period and master_period_start is not None and master_period_start <= master_period_end
 
@@ -704,8 +786,10 @@ if use_master_active and doj_col and exit_col and doj_col in df.columns and exit
     _is_resigned = is_resigned_mask(df)
     _exited_in_window = _is_resigned & (df[exit_col] >= _range_start_ts) & (df[exit_col] < _range_end_ts)
     df_period = df[_joined_in_window | _exited_in_window]
+    df_period_is_exit = _exited_in_window.loc[df_period.index]
 else:
     df_period = df
+    df_period_is_exit = pd.Series(False, index=df_period.index)
 
 # ==========================================================================
 # Sidebar — Joining Period (dedicated joining-date range — answers "how
@@ -1034,8 +1118,13 @@ with tab_snapshot:
         snap_exits_df = pd.DataFrame()
         snap_joiners_df = pd.DataFrame()
 
-    snap_pip_df = _pip_in_progress(pip_seg_all_status)  # always "In Progress" — never date-scoped, never affected by the sidebar's manual Review Status picker
-    _pip_label = "Currently on PIP (In Progress)" if pip_status_col else "Currently on PIP (no Review Status column found)"
+    snap_pip_df = _pip_active_as_of(pip_seg_all_status, as_of_date)
+    if pip_start_col:
+        _pip_label = f"On PIP (as of {as_of_date})"
+    elif pip_status_col:
+        _pip_label = "Currently on PIP (In Progress) — no PIP Start Date, so this can only show today's status"
+    else:
+        _pip_label = "Currently on PIP (no Review Status or PIP Start Date column found)"
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric(f"Active Headcount (as of {as_of_date})", snap_active_hc if snap_active_hc is not None else "—")
@@ -1087,26 +1176,67 @@ with tab_overview:
     gender_col = roles.get("gender")
     dept_col = roles.get("department")
     loc_col = roles.get("location")
+    active_df_period = df_period[~is_resigned_mask(df_period)]
 
     cols_avail = [c for c in [gender_col, dept_col, loc_col] if c and clean_series(df_period, c)]
     if cols_avail:
         cols_ui = st.columns(len(cols_avail))
         for i, col in enumerate(cols_avail):
-            vc = df_period[col].value_counts().head(10)
             if col == gender_col:
+                vc = df_period[col].value_counts().head(10)
                 fig = px.pie(values=vc.values, names=vc.index, hole=0.5, title="Gender Diversity",
                              color_discrete_sequence=PALETTE)
+                # Plotly's default legend sits to the right of the chart,
+                # which — in a narrow Streamlit column — can visually spill
+                # into the NEXT column's chart, making it look like that
+                # chart's legend belongs to it. Anchor it below the donut
+                # instead, fully contained within this chart's own space.
+                fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.05,
+                                               xanchor="center", x=0.5))
+                _click_source, _click_type = df_period, "pie"
+            elif col == dept_col and gender_col and gender_col in active_df_period.columns:
+                # Active employees only, bifurcated by gender (stacked bar),
+                # using the same colors as the Gender Diversity pie.
+                dept_order = active_df_period[dept_col].value_counts().head(10).index.tolist()
+                _plot_df = active_df_period[active_df_period[dept_col].isin(dept_order)]
+                gender_vals = _plot_df[gender_col].dropna().unique().tolist()
+                male_like = [v for v in gender_vals if "female" not in str(v).lower() and "male" in str(v).lower()]
+                other_vals = [v for v in gender_vals if v not in male_like]
+                gender_order = male_like + other_vals
+                color_map = {v: PALETTE[j % len(PALETTE)] for j, v in enumerate(gender_order)}
+                fig = px.bar(
+                    _plot_df.groupby([dept_col, gender_col]).size().reset_index(name="Headcount"),
+                    x="Headcount", y=dept_col, color=gender_col, orientation="h",
+                    category_orders={dept_col: dept_order, gender_col: gender_order},
+                    color_discrete_map=color_map, title="Department (Active Employees)",
+                )
+                fig.update_layout(yaxis_title=None, xaxis_title="Headcount", legend_title_text="")
+                _click_source, _click_type = active_df_period, "bar"
             else:
+                vc = df_period[col].value_counts().head(10)
                 fig = px.bar(vc, orientation="h", title=col, color_discrete_sequence=PALETTE)
                 fig.update_layout(showlegend=False, yaxis_title=None, xaxis_title="Headcount")
-            cols_ui[i].plotly_chart(fig, use_container_width=True, key=f"ov_{col}")
+                _click_source, _click_type = df_period, "bar"
+            with cols_ui[i]:
+                clickable_chart(fig, _click_source, col, key=f"ov_{col}", chart_type=_click_type)
     else:
         st.info("No demographic fields detected to chart.")
 
     st.subheader("Employee List (filtered)")
-    st.dataframe(df_period, use_container_width=True, height=350)
-    st.download_button("Download filtered data (CSV)", df_period.to_csv(index=False).encode("utf-8"),
-                        "filtered_employees.csv", "text/csv")
+    if use_master_active:
+        _df_period_display = df_period.copy()
+        _df_period_display.insert(0, "Event Type", df_period_is_exit.map({True: "Exit", False: "Joiner"}))
+        _df_period_display = _df_period_display.sort_values(
+            "Event Type", key=lambda s: s.map({"Joiner": 0, "Exit": 1})
+        )
+        st.caption("Sorted with joiners first, exits last.")
+        st.dataframe(_df_period_display, use_container_width=True, height=350)
+        st.download_button("Download filtered data (CSV)", _df_period_display.to_csv(index=False).encode("utf-8"),
+                            "filtered_employees.csv", "text/csv")
+    else:
+        st.dataframe(df_period, use_container_width=True, height=350)
+        st.download_button("Download filtered data (CSV)", df_period.to_csv(index=False).encode("utf-8"),
+                            "filtered_employees.csv", "text/csv")
 
 with tab_reasons:
     st.header("📌 Reasons & Managers", anchor="reasons")
@@ -1120,10 +1250,19 @@ with tab_reasons:
         st.metric("Left within 6 months of joining", f"{early_attrition_count} ({early_attrition_pct_of_exits}% of exits)",
                    help=f"{early_attrition_count} of the {len(exited_period)} exits in the current filter/period "
                         f"selection left within 182 days of joining.")
-        st.dataframe(early_attrition_df, use_container_width=True, height=300)
+        st.caption(f"The **{roles.get('exit_date')}** column is what's scoped to the selected range — "
+                    f"**{doj_col}** can legitimately be earlier, since this table is about people who left "
+                    f"within 6 months of *their own* join date, not people who joined within the range.")
+        early_attrition_display = early_attrition_df.copy()
+        if doj_col in early_attrition_display.columns and exit_col in early_attrition_display.columns:
+            early_attrition_display.insert(
+                early_attrition_display.columns.get_loc(exit_col) + 1, "Tenure at Exit (Days)",
+                (early_attrition_display[exit_col] - early_attrition_display[doj_col]).dt.days,
+            )
+        st.dataframe(early_attrition_display, use_container_width=True, height=300)
         st.download_button(
             "Download early leavers (CSV)",
-            early_attrition_df.to_csv(index=False).encode("utf-8"),
+            early_attrition_display.to_csv(index=False).encode("utf-8"),
             "early_attrition.csv", "text/csv", key="dl_early_attrition",
         )
         st.divider()
@@ -1161,14 +1300,14 @@ with tab_reasons:
                 vc = exited_period[reason_col].value_counts().head(10)
                 fig = px.bar(vc, orientation="h", title="Attrition Reasons", color_discrete_sequence=PALETTE)
                 fig.update_layout(showlegend=False, yaxis_title=None, xaxis_title="Exits")
-                st.plotly_chart(fig, use_container_width=True)
+                clickable_chart(fig, exited_period, reason_col, key="reasons_bar", chart_type="bar")
         with c2:
             type_col = roles.get("attrition_type")
             if type_col and exited_period[type_col].notna().any():
                 vc = exited_period[type_col].value_counts()
                 fig = px.pie(values=vc.values, names=vc.index, hole=0.5, title="Voluntary vs Involuntary",
                              color_discrete_sequence=PALETTE)
-                st.plotly_chart(fig, use_container_width=True)
+                clickable_chart(fig, exited_period, type_col, key="voluntary_pie", chart_type="pie")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1183,25 +1322,29 @@ with tab_reasons:
             mgr_tbl["Attrition Count"] = mgr_tbl["Attrition Count"].astype(int)
             mgr_tbl["Attrition %"] = (mgr_tbl["Attrition Count"] / mgr_tbl["Headcount"] * 100).round(1)
             mgr_tbl = mgr_tbl.sort_values("Attrition %", ascending=False)
-            mgr_tbl.index.name = "Reporting Manager"
-            st.dataframe(mgr_tbl, use_container_width=True, height=380)
+            mgr_tbl.index.name = mgr_col
+            clickable_table(mgr_tbl, df_period, mgr_col, key="mgr_tbl")
         else:
             st.info("No reporting-manager field detected in this dataset.")
 
     with c2:
-        st.subheader("Department Attrition Rate")
-        dept_col = roles.get("department")
-        if dept_col and dept_col in df_period.columns and df_period[dept_col].notna().any():
-            hc_by_dept = df_period[dept_col].value_counts()
-            exit_by_dept = exited_period[dept_col].value_counts() if not exited_period.empty else pd.Series(dtype=int)
+        # Sub Department gives a finer-grained breakdown than Department;
+        # prefer it when the sheet has one, and fall back to Department
+        # only if there's no Sub Department column at all.
+        sub_dept_col = roles.get("sub_department")
+        dept_col_for_table = sub_dept_col or roles.get("department")
+        st.subheader(f"{dept_col_for_table} Attrition Rate" if dept_col_for_table else "Department Attrition Rate")
+        if dept_col_for_table and dept_col_for_table in df_period.columns and df_period[dept_col_for_table].notna().any():
+            hc_by_dept = df_period[dept_col_for_table].value_counts()
+            exit_by_dept = exited_period[dept_col_for_table].value_counts() if not exited_period.empty else pd.Series(dtype=int)
             dept_tbl = pd.DataFrame({"Headcount": hc_by_dept}).join(
                 pd.DataFrame({"Attrition Count": exit_by_dept}), how="left"
             ).fillna(0)
             dept_tbl["Attrition Count"] = dept_tbl["Attrition Count"].astype(int)
             dept_tbl["Attrition %"] = (dept_tbl["Attrition Count"] / dept_tbl["Headcount"] * 100).round(1)
             dept_tbl = dept_tbl.sort_values("Attrition %", ascending=False)
-            dept_tbl.index.name = "Department"
-            st.dataframe(dept_tbl, use_container_width=True, height=380)
+            dept_tbl.index.name = dept_col_for_table
+            clickable_table(dept_tbl, df_period, dept_col_for_table, key="dept_tbl")
         else:
             st.info("No department field detected in this dataset.")
 
@@ -1210,7 +1353,10 @@ with tab_np:
     if selected_verticals:
         st.caption(f"Vertical filter active: **{', '.join(selected_verticals)}**")
     if use_master_active:
-        st.caption(f"Master date range active: **{master_period_start} → {master_period_end}**")
+        st.caption(f"Master date range active: **{master_period_start} → {master_period_end}** — this doesn't "
+                    f"affect On Notice Period or PIP below; both always show the current list (PIP: In Progress "
+                    f"only). For a historical PIP question ('who was on PIP 3 months ago'), use the Weekly "
+                    f"Snapshot section's as-of-date control instead.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1220,7 +1366,7 @@ with tab_np:
         else:
             st.dataframe(notice_f, use_container_width=True, height=420)
     with c2:
-        st.subheader(f"On PIP ({len(pip_f)})")
+        st.subheader(f"On PIP — In Progress ({len(pip_f)})")
         if pip_f.empty:
             st.info("No PIP records for the current selection.")
         else:
@@ -1228,7 +1374,7 @@ with tab_np:
                 vc = pip_f[pip_status_col].value_counts()
                 fig = px.pie(values=vc.values, names=vc.index, hole=0.5, title="PIP Review Status",
                              color_discrete_sequence=PALETTE)
-                st.plotly_chart(fig, use_container_width=True)
+                clickable_chart(fig, pip_f, pip_status_col, key="pip_status_pie", chart_type="pie")
             st.dataframe(pip_f, use_container_width=True, height=420)
 
 if tab_joiners is not None:
@@ -1291,7 +1437,7 @@ with tab_exits:
             vc = exits_f[reason_col].value_counts().head(10)
             fig = px.bar(vc, orientation="h", title="Exit Reasons (Tracker)", color_discrete_sequence=PALETTE)
             fig.update_layout(showlegend=False, yaxis_title=None, xaxis_title="Exits")
-            st.plotly_chart(fig, use_container_width=True)
+            clickable_chart(fig, exits_f, reason_col, key="exit_reasons_bar", chart_type="bar")
         st.dataframe(exits_f, use_container_width=True, height=420)
 
 with tab_birthdays:
