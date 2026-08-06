@@ -664,6 +664,49 @@ def is_resigned_mask(tdf):
     return pd.Series(False, index=tdf.index)
 
 
+VOLUNTARY_REASON_KEYWORDS = [
+    "better opportunity", "personal reason", "health issue", "higher education",
+    "relocation", "work life balance", "worklife balance", "moving abroad",
+    "moved to us", "job dissatisfaction", "h1b transfer", "us transfer",
+    "resignation", "resigned",
+]
+INVOLUNTARY_REASON_KEYWORDS = [
+    "performance issue", "non-performance", "non performance", "pip",
+    "termination", "terminated", "re-org", "reorg", "absconded", "bgv failure",
+    "background verification", "layoff", "redundan", "death", "proxy",
+    "contract end",
+]
+
+
+def classify_exit_type(tdf):
+    """Voluntary / Involuntary / Unclassified for each row. Prefers the
+    sheet's own Attrition Type column when present — that's HR-curated and
+    per-row, so it correctly captures cases where the same reason text (e.g.
+    'InterCompany Transfer') is Voluntary in some cases and Involuntary in
+    others, which no reason-text rule could ever get right. Falls back to a
+    conservative keyword match against the Reason column only when there's
+    no Attrition Type column at all; anything unrecognized stays
+    'Unclassified' rather than being silently guessed."""
+    if tdf.empty:
+        return pd.Series(dtype=object)
+    attrition_type_col = roles.get("attrition_type")
+    if attrition_type_col and attrition_type_col in tdf.columns and tdf[attrition_type_col].notna().any():
+        return tdf[attrition_type_col].fillna("Unclassified")
+    r_col = find_col(tdf, "reason")
+    if not r_col or r_col not in tdf.columns:
+        return pd.Series("Unclassified", index=tdf.index)
+
+    def _classify(val):
+        s = str(val).lower()
+        if any(kw in s for kw in INVOLUNTARY_REASON_KEYWORDS):
+            return "Involuntary"
+        if any(kw in s for kw in VOLUNTARY_REASON_KEYWORDS):
+            return "Voluntary"
+        return "Unclassified"
+
+    return tdf[r_col].apply(_classify)
+
+
 def _resigned_in_range(tdf, range_start, range_end):
     """Resigned rows only, further scoped to those whose exit date falls in
     the given range."""
@@ -1384,6 +1427,22 @@ with tab_exits:
     if selected_verticals:
         st.caption(f"Vertical filter active: **{', '.join(selected_verticals)}**")
 
+    exit_type_choice = st.radio(
+        "Exit Type", ["All", "Voluntary", "Involuntary"], horizontal=True, key="exit_type_filter",
+        help="Voluntary/Involuntary comes from the Attrition Type column when your data has one (per-row, "
+             "HR-curated — the most reliable source). If a sheet doesn't have that column, it's inferred from "
+             "the Reason text instead, and anything not recognized is labeled 'Unclassified' rather than guessed.",
+    )
+
+    def _apply_exit_type(tdf):
+        if tdf.empty or exit_type_choice == "All":
+            return tdf
+        return tdf[classify_exit_type(tdf) == exit_type_choice]
+
+    exited_custom_view = _apply_exit_type(exited_custom)
+    exited_period_view = _apply_exit_type(exited_period)
+    exits_f_view = _apply_exit_type(exits_f)
+
     # "Exits between X and Y" and "Exited Employees — Employee Master" used
     # to both render whenever Exit Period (or the Master Date Filter, which
     # forces it on) was active — but exited_period IS exited_custom in that
@@ -1391,41 +1450,41 @@ with tab_exits:
     # actually applies, not both.
     if use_exit_period:
         st.subheader(f"Exits between {exit_period_start} and {exit_period_end}")
-        st.metric("Employees who left in this range", len(exited_custom))
-        if exited_custom.empty:
+        st.metric("Employees who left in this range", len(exited_custom_view))
+        if exited_custom_view.empty:
             st.info("No employees exited in the selected range.")
         else:
-            st.dataframe(exited_custom, use_container_width=True, height=300)
+            st.dataframe(exited_custom_view, use_container_width=True, height=300)
             st.download_button(
                 "Download exits in range (CSV)",
-                exited_custom.to_csv(index=False).encode("utf-8"),
+                exited_custom_view.to_csv(index=False).encode("utf-8"),
                 "exits_in_range.csv", "text/csv", key="dl_exit_period",
             )
     else:
-        st.subheader(f"Exited Employees — Employee Master ({len(exited_period)})")
-        if exited_period.empty:
+        st.subheader(f"Exited Employees — Employee Master ({len(exited_period_view)})")
+        if exited_period_view.empty:
             st.info("No exited employees for the current selection.")
         else:
-            st.dataframe(exited_period, use_container_width=True, height=300)
+            st.dataframe(exited_period_view, use_container_width=True, height=300)
             st.download_button(
                 "Download exited employees (CSV)",
-                exited_period.to_csv(index=False).encode("utf-8"),
+                exited_period_view.to_csv(index=False).encode("utf-8"),
                 "exited_employees.csv", "text/csv", key="dl_exited_period",
             )
 
     st.divider()
 
-    st.subheader(f"Exit Tracker ({len(exits_f)})")
-    if exits_f.empty:
+    st.subheader(f"Exit Tracker ({len(exits_f_view)})")
+    if exits_f_view.empty:
         st.info("No exit-tracker records for the current selection.")
     else:
-        reason_col = find_col(exits_f, "reason")
-        if reason_col and exits_f[reason_col].notna().any():
-            vc = exits_f[reason_col].value_counts().head(10)
+        reason_col = find_col(exits_f_view, "reason")
+        if reason_col and exits_f_view[reason_col].notna().any():
+            vc = exits_f_view[reason_col].value_counts().head(10)
             fig = px.bar(vc, orientation="h", title="Exit Reasons (Tracker)", color_discrete_sequence=PALETTE)
             fig.update_layout(showlegend=False, yaxis_title=None, xaxis_title="Exits")
-            clickable_chart(fig, exits_f, reason_col, key="exit_reasons_bar", chart_type="bar")
-        st.dataframe(exits_f, use_container_width=True, height=420)
+            clickable_chart(fig, exits_f_view, reason_col, key="exit_reasons_bar", chart_type="bar")
+        st.dataframe(exits_f_view, use_container_width=True, height=420)
 
 with tab_birthdays:
     st.header("🎂 Birthdays", anchor="birthdays")
