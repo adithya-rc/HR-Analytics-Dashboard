@@ -1210,15 +1210,39 @@ with tab_overview:
     gender_col = roles.get("gender")
     dept_col = roles.get("department")
     loc_col = roles.get("location")
+    status_col = roles.get("status")
     active_df_period = df_period[~is_resigned_mask(df_period)]
 
+    def _gender_bifurcated_bar(source_df, category_col, title, top_n=10):
+        """Stacked horizontal bar of `category_col`, split by gender, using
+        the same color convention as the Gender Diversity pie (Male=teal,
+        Female=orange). Returns (fig, plot_df) for click-drilldown."""
+        cat_order = source_df[category_col].value_counts().head(top_n).index.tolist()
+        plot_df = source_df[source_df[category_col].isin(cat_order)]
+        gender_vals = plot_df[gender_col].dropna().unique().tolist()
+        male_like = [v for v in gender_vals if "female" not in str(v).lower() and "male" in str(v).lower()]
+        other_vals = [v for v in gender_vals if v not in male_like]
+        gender_order = male_like + other_vals
+        color_map = {v: PALETTE[j % len(PALETTE)] for j, v in enumerate(gender_order)}
+        fig = px.bar(
+            plot_df.groupby([category_col, gender_col]).size().reset_index(name="Headcount"),
+            x="Headcount", y=category_col, color=gender_col, orientation="h",
+            category_orders={category_col: cat_order, gender_col: gender_order},
+            color_discrete_map=color_map, title=title,
+        )
+        fig.update_layout(yaxis_title=None, xaxis_title="Headcount", legend_title_text="")
+        return fig, plot_df
+
     cols_avail = [c for c in [gender_col, dept_col, loc_col] if c and clean_series(df_period, c)]
+    _rendered_any = bool(cols_avail)
     if cols_avail:
         cols_ui = st.columns(len(cols_avail))
         for i, col in enumerate(cols_avail):
             if col == gender_col:
-                vc = df_period[col].value_counts().head(10)
-                fig = px.pie(values=vc.values, names=vc.index, hole=0.5, title="Gender Diversity",
+                # Active employees only — resigned people shouldn't inflate
+                # today's gender split, same reasoning as the Department chart.
+                vc = active_df_period[col].value_counts().head(10)
+                fig = px.pie(values=vc.values, names=vc.index, hole=0.5, title="Gender Diversity (Active Employees)",
                              color_discrete_sequence=PALETTE)
                 # Plotly's default legend sits to the right of the chart,
                 # which — in a narrow Streamlit column — can visually spill
@@ -1227,25 +1251,10 @@ with tab_overview:
                 # instead, fully contained within this chart's own space.
                 fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.05,
                                                xanchor="center", x=0.5))
-                _click_source, _click_type = df_period, "pie"
+                _click_source, _click_type = active_df_period, "pie"
             elif col == dept_col and gender_col and gender_col in active_df_period.columns:
-                # Active employees only, bifurcated by gender (stacked bar),
-                # using the same colors as the Gender Diversity pie.
-                dept_order = active_df_period[dept_col].value_counts().head(10).index.tolist()
-                _plot_df = active_df_period[active_df_period[dept_col].isin(dept_order)]
-                gender_vals = _plot_df[gender_col].dropna().unique().tolist()
-                male_like = [v for v in gender_vals if "female" not in str(v).lower() and "male" in str(v).lower()]
-                other_vals = [v for v in gender_vals if v not in male_like]
-                gender_order = male_like + other_vals
-                color_map = {v: PALETTE[j % len(PALETTE)] for j, v in enumerate(gender_order)}
-                fig = px.bar(
-                    _plot_df.groupby([dept_col, gender_col]).size().reset_index(name="Headcount"),
-                    x="Headcount", y=dept_col, color=gender_col, orientation="h",
-                    category_orders={dept_col: dept_order, gender_col: gender_order},
-                    color_discrete_map=color_map, title="Department (Active Employees)",
-                )
-                fig.update_layout(yaxis_title=None, xaxis_title="Headcount", legend_title_text="")
-                _click_source, _click_type = active_df_period, "bar"
+                fig, _click_source = _gender_bifurcated_bar(active_df_period, dept_col, "Department (Active Employees)")
+                _click_type = "bar"
             else:
                 vc = df_period[col].value_counts().head(10)
                 fig = px.bar(vc, orientation="h", title=col, color_discrete_sequence=PALETTE)
@@ -1253,7 +1262,28 @@ with tab_overview:
                 _click_source, _click_type = df_period, "bar"
             with cols_ui[i]:
                 clickable_chart(fig, _click_source, col, key=f"ov_{col}", chart_type=_click_type)
-    else:
+
+    # Employment Type (Employee Status, excluding Resigned since
+    # active_df_period already excludes it) — bifurcated by gender, same
+    # treatment as Department above.
+    if status_col and status_col in active_df_period.columns and gender_col and gender_col in active_df_period.columns \
+            and clean_series(active_df_period, status_col):
+        et_c1, et_c2 = st.columns([3, 2])
+        with et_c1:
+            fig, _et_source = _gender_bifurcated_bar(active_df_period, status_col, "Employment Type (Active Employees)")
+            clickable_chart(fig, _et_source, status_col, key="ov_employment_type", chart_type="bar")
+        with et_c2:
+            st.caption("Exact counts")
+            et_pivot = (
+                active_df_period.groupby([status_col, gender_col]).size()
+                .unstack(gender_col, fill_value=0)
+            )
+            et_pivot["Total"] = et_pivot.sum(axis=1)
+            et_pivot = et_pivot.sort_values("Total", ascending=False)
+            st.dataframe(et_pivot, use_container_width=True, height=min(380, 40 * (len(et_pivot) + 1)))
+        _rendered_any = True
+
+    if not _rendered_any:
         st.info("No demographic fields detected to chart.")
 
     st.subheader("Employee List (filtered)")
